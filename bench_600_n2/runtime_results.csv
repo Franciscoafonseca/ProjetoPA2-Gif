@@ -1,0 +1,2 @@
+particles,ranks,years,dt,requested_plot_interval,actual_plot_interval,frames,mode,simulation_runtime,total_runtime,physics_time,mpi_time,diagnostics_time,plotting_time,gif_time,final_kinetic,final_potential,final_total_energy,final_energy_drift_percent,final_rmax
+600,2,6000.0,20.0,1000.0,1000.0,7,benchmark,14.642399,14.646590,6.941125,6.591356,0.115109,7.132104,0.000000,9.37748428e+02,-1.99586054e+03,-1.05811212e+03,0.704270,113.467040

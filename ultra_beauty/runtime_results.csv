@@ -1,0 +1,2 @@
+particles,ranks,years,dt,requested_plot_interval,actual_plot_interval,frames,mode,simulation_runtime,total_runtime,physics_time,mpi_time,diagnostics_time,plotting_time,gif_time,final_kinetic,final_potential,final_total_energy,final_energy_drift_percent,final_rmax
+420,4,6000.0,10.0,300.0,300.0,21,beauty,32.966267,37.374101,2.649834,28.610627,0.222541,28.706788,4.399458,9.76303824e+02,-2.32349652e+03,-1.34719269e+03,-0.306600,155.656990
