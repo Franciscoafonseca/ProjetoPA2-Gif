@@ -117,7 +117,7 @@ Tabela para preencher com medicoes reais apos correr no computador/laboratorio:
 Comandos sugeridos:
 
 ```bash
-mpiexec -n 1 python galaxy_mpi.py --particles 400 --years 5000 --dt 20
+mpiexec -n 1 python "C:\Projetos\Pa\ProjetoPA2-Gif\galaxy_mpi.py" --particles 400 --years 5000 --dt 20
 mpiexec -n 2 python galaxy_mpi.py --particles 400 --years 5000 --dt 20
 mpiexec -n 4 python galaxy_mpi.py --particles 400 --years 5000 --dt 20
 ```
