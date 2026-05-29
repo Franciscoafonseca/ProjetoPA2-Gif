@@ -1,2 +1,0 @@
-particles,ranks,years,dt,steps,force_evals,total_interactions,calibration_rate_interactions_per_sec,estimated_runtime_seconds,estimated_runtime_human,core_memory_all_particles,max_local_memory_per_rank,rank0_peak_memory_conservative,counts
-1000000000,4,20.0,20.0,1,2,2.000000e+18,6.680000e+07,2.994012e+10,948.75 years,59.60 GB,14.90 GB,178.81 GB,"[250000000, 250000000, 250000000, 250000000]"
