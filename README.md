@@ -3,7 +3,7 @@
 **Disciplina:** Programacao Avancada - Modulo de Computacao Paralela  
 **Universidade:** Universidade da Madeira  
 **Ano:** 2025/2026  
-**Grupo:** substituir por ID_ID_ID_ID  
+**Grupo:** 2120622_2109923_2141823
 
 ## 1. Objetivo
 
@@ -150,10 +150,9 @@ Preencher antes da entrega:
 
 | Membro | Numero de aluno | Contribuicao |
 |---|---|---|
-| Nome 1 | ID | Implementacao MPI / testes |
-| Nome 2 | ID | Modelo fisico / relatorio |
-| Nome 3 | ID | Visualizacao / GIF |
-| Nome 4 | ID | Analise de desempenho |
+| Francisco Afonseca | 2120622 | Implementacao MPI / Testes / Analise de desempenho |
+| Francisco Palmeira | 2109923 | Modelo fisico / relatorio |
+| Jorge Santos | 2141823 | Visualizacao / GIF |
 
 ## 12. Conclusao
 
