@@ -2,30 +2,29 @@
 """
 mpi_parallelization.py
 
-Criteria covered:
-- Parallelization quality.
-- Correct use of MPI methods.
+Camada MPI da simulação.
 
-This module contains the distributed-memory logic:
-- bcast: configuration distribution;
-- scatter: initial particle distribution;
-- isend/irecv: ring exchange of particle blocks for force computation;
-- gather: snapshot collection for plotting;
-- reduce: particle-count validation;
-- allreduce: global diagnostics;
-- Barrier: synchronization before/after timing.
-
-The physics formulas are imported from physical_correctness.py so that the code is
-cleanly separated by grading criterion.
+Métodos usados de forma justificada:
+- bcast(): todos os ranks recebem a mesma configuração;
+- scatter(): rank 0 distribui IDs das partículas;
+- allgather(): todos ficam a saber a carga de trabalho por rank;
+- isend()/irecv(): troca em anel dos blocos para calcular forças;
+- gather(): rank 0 recolhe snapshots para plotting;
+- reduce(): valida total de partículas;
+- allreduce(): combina diagnósticos físicos globais;
+- Barrier(): sincronização antes/depois das fases temporizadas.
 """
-
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from physical_correctness import acceleration_from_block, central_mass_acceleration
+from physical_correctness import (
+    acceleration_from_block,
+    central_mass_acceleration,
+    generate_local_initial_conditions,
+)
 
 Array = np.ndarray
 
@@ -50,7 +49,7 @@ class _DummyComm:
 
     def scatter(self, seq: Optional[List[Any]], root: int = 0) -> Any:
         if seq is None:
-            raise RuntimeError("Serial scatter received None.")
+            raise RuntimeError("Serial scatter recebeu None.")
         return seq[0]
 
     def gather(self, obj: Any, root: int = 0) -> List[Any]:
@@ -88,7 +87,7 @@ class _DummyMPI:
 
 
 def get_mpi(allow_serial: bool = False) -> Tuple[Any, Any, bool]:
-    """Return MPI, communicator and whether we are using serial fallback."""
+    """Obtém MPI real ou fallback serial apenas se --allow-serial for usado."""
     try:
         from mpi4py import MPI  # type: ignore
 
@@ -97,12 +96,13 @@ def get_mpi(allow_serial: bool = False) -> Tuple[Any, Any, bool]:
         if allow_serial:
             return _DummyMPI, _DummyMPI.COMM_WORLD, True
         raise SystemExit(
-            "mpi4py is not available. Install mpi4py/OpenMPI or run with --allow-serial for a local preview."
+            "mpi4py não está disponível. Ativa o ambiente py38 e instala mpi4py/openmpi, "
+            "ou corre com --allow-serial apenas para pré-visualização."
         ) from exc
 
 
-def bcast_config(comm: Any, rank: int, args) -> Any:
-    """Broadcast argparse configuration from rank 0 to all ranks."""
+def bcast_config(comm: Any, rank: int, args: Any) -> Any:
+    """Distribui os parâmetros da simulação a todos os processos."""
     config = vars(args).copy() if rank == 0 else None
     config = comm.bcast(config, root=0)
     for key, value in config.items():
@@ -111,39 +111,42 @@ def bcast_config(comm: Any, rank: int, args) -> Any:
 
 
 def partition_counts(total: int, size: int) -> List[int]:
-    """Balanced 1D block distribution."""
-    base = int(total) // int(size)
-    rem = int(total) % int(size)
-    return [base + (1 if r < rem else 0) for r in range(int(size))]
+    """Distribuição 1D equilibrada por blocos."""
+    total = int(total)
+    size = max(1, int(size))
+    base = total // size
+    rem = total % size
+    return [base + (1 if r < rem else 0) for r in range(size)]
 
 
-def split_particle_chunks(ids: Array, pos: Array, vel: Array, mass: Array, size: int) -> List[Dict[str, Array]]:
-    """Split particles on rank 0 before scatter."""
-    counts = partition_counts(len(ids), size)
-    chunks: List[Dict[str, Array]] = []
+def split_id_chunks(total: int, size: int) -> List[Array]:
+    """Rank 0 cria apenas IDs; cada rank gera os seus dados localmente."""
+    counts = partition_counts(int(total), int(size))
+    chunks: List[Array] = []
     start = 0
     for count in counts:
-        end = start + count
-        chunks.append(
-            {
-                "ids": np.ascontiguousarray(ids[start:end], dtype=np.int64),
-                "pos": np.ascontiguousarray(pos[start:end], dtype=np.float64),
-                "vel": np.ascontiguousarray(vel[start:end], dtype=np.float64),
-                "mass": np.ascontiguousarray(mass[start:end], dtype=np.float64),
-            }
-        )
-        start = end
+        stop = start + count
+        chunks.append(np.arange(start, stop, dtype=np.int64))
+        start = stop
     return chunks
 
 
-def scatter_particles(comm: Any, chunks: Optional[List[Dict[str, Array]]]) -> Dict[str, Array]:
-    """Distribute particle chunks from rank 0 to every MPI rank."""
-    local = comm.scatter(chunks, root=0)
+def scatter_ids(comm: Any, rank: int, size: int, total_particles: int) -> Array:
+    """Distribui IDs das partículas com scatter()."""
+    chunks = split_id_chunks(total_particles, size) if rank == 0 else None
+    local_ids = comm.scatter(chunks, root=0)
+    return np.ascontiguousarray(local_ids, dtype=np.int64)
+
+
+def create_local_particles(comm: Any, rank: int, size: int, args: Any) -> Dict[str, Array]:
+    """Scatter de IDs + geração paralela das condições iniciais em cada rank."""
+    local_ids = scatter_ids(comm, rank, size, int(args.particles))
+    ids, pos, vel, mass = generate_local_initial_conditions(local_ids, args, rank=rank)
     return {
-        "ids": np.ascontiguousarray(local["ids"], dtype=np.int64),
-        "pos": np.ascontiguousarray(local["pos"], dtype=np.float64),
-        "vel": np.ascontiguousarray(local["vel"], dtype=np.float64),
-        "mass": np.ascontiguousarray(local["mass"], dtype=np.float64),
+        "ids": np.ascontiguousarray(ids, dtype=np.int64),
+        "pos": np.ascontiguousarray(pos, dtype=np.float64),
+        "vel": np.ascontiguousarray(vel, dtype=np.float64),
+        "mass": np.ascontiguousarray(mass, dtype=np.float64),
     }
 
 
@@ -153,22 +156,26 @@ def compute_acceleration_ring(
     size: int,
     local_pos: Array,
     local_mass: Array,
-    args,
+    args: Any,
     timers: Optional[Dict[str, float]] = None,
 ) -> Array:
-    """Compute acceleration on local particles using a ring exchange.
+    """
+    Calcula aceleração nas partículas locais com troca em anel.
 
-    Each rank owns only a subset of particles. To compute the full gravitational
-    field without gathering every particle to rank 0 at each time step, the local
-    particle block is circulated through ranks using non-blocking isend/irecv.
-    At every hop, each rank adds the force contribution from the received block.
+    Cada rank começa com o seu bloco. Em cada hop calcula forças desse bloco,
+    envia-o ao próximo rank com isend() e recebe o bloco anterior com irecv().
+    Assim todos os ranks acabam por considerar todas as partículas sem juntar tudo
+    no rank 0 durante a física.
     """
     import time
 
+    local_pos = np.ascontiguousarray(local_pos, dtype=np.float64)
+    local_mass = np.ascontiguousarray(local_mass, dtype=np.float64)
     acc = np.zeros_like(local_pos, dtype=np.float64)
-    block_pos = np.ascontiguousarray(local_pos, dtype=np.float64)
-    block_mass = np.ascontiguousarray(local_mass, dtype=np.float64)
-    owner = rank
+
+    block_pos = local_pos.copy()
+    block_mass = local_mass.copy()
+    owner = int(rank)
 
     for hop in range(int(size)):
         t0 = time.perf_counter()
@@ -183,15 +190,18 @@ def compute_acceleration_ring(
         if timers is not None:
             timers["physics"] = timers.get("physics", 0.0) + (time.perf_counter() - t0)
 
-        if size > 1:
-            next_rank = (rank + 1) % size
-            prev_rank = (rank - 1) % size
+        if int(size) > 1 and hop < int(size) - 1:
+            next_rank = (int(rank) + 1) % int(size)
+            prev_rank = (int(rank) - 1) % int(size)
             payload = (block_pos, block_mass, owner)
+
             t1 = time.perf_counter()
-            send_req = comm.isend(payload, dest=next_rank, tag=9100 + hop)
-            recv_req = comm.irecv(source=prev_rank, tag=9100 + hop)
+            send_req = comm.isend(payload, dest=next_rank, tag=8100 + hop)
+            recv_req = comm.irecv(source=prev_rank, tag=8100 + hop)
             block_pos, block_mass, owner = recv_req.wait()
             send_req.wait()
+            block_pos = np.ascontiguousarray(block_pos, dtype=np.float64)
+            block_mass = np.ascontiguousarray(block_mass, dtype=np.float64)
             if timers is not None:
                 timers["communication"] = timers.get("communication", 0.0) + (time.perf_counter() - t1)
 
@@ -200,28 +210,27 @@ def compute_acceleration_ring(
 
 
 def gather_snapshot(comm: Any, local: Dict[str, Array], root: int = 0) -> Optional[Dict[str, Array]]:
-    """Gather local particle arrays on rank 0 for plotting and diagnostics."""
-    gathered = comm.gather(local, root=root)
-    # Dummy communicator always returns a list, MPI non-root returns None.
-    if gathered is None:
+    """Recolhe posições/velocidades/massas no rank 0 para criar frames."""
+    packed = {
+        "ids": np.ascontiguousarray(local["ids"], dtype=np.int64),
+        "pos": np.ascontiguousarray(local["pos"], dtype=np.float64),
+        "vel": np.ascontiguousarray(local["vel"], dtype=np.float64),
+        "mass": np.ascontiguousarray(local["mass"], dtype=np.float64),
+    }
+    gathered = comm.gather(packed, root=root)
+    if gathered is None or not isinstance(gathered, list):
         return None
-    if not isinstance(gathered, list):
-        return None
+
     ids = np.concatenate([g["ids"] for g in gathered])
     pos = np.concatenate([g["pos"] for g in gathered])
     vel = np.concatenate([g["vel"] for g in gathered])
     mass = np.concatenate([g["mass"] for g in gathered])
     order = np.argsort(ids)
-    return {
-        "ids": ids[order],
-        "pos": pos[order],
-        "vel": vel[order],
-        "mass": mass[order],
-    }
+    return {"ids": ids[order], "pos": pos[order], "vel": vel[order], "mass": mass[order]}
 
 
 def allreduce_basic_diagnostics(comm: Any, MPI: Any, local_diag: Dict[str, Any]) -> Dict[str, float]:
-    """Combine rank-local diagnostics using MPI allreduce."""
+    """Combina diagnósticos locais usando allreduce()."""
     kinetic = comm.allreduce(float(local_diag["kinetic"]), op=MPI.SUM)
     total_mass = comm.allreduce(float(local_diag["mass"]), op=MPI.SUM)
     speed_mass_sum = comm.allreduce(float(local_diag["speed_mass_sum"]), op=MPI.SUM)
@@ -229,11 +238,18 @@ def allreduce_basic_diagnostics(comm: Any, MPI: Any, local_diag: Dict[str, Any])
     max_radius = comm.allreduce(float(local_diag["max_radius"]), op=MPI.MAX)
     angular = comm.allreduce(np.asarray(local_diag["angular_momentum"], dtype=np.float64), op=MPI.SUM)
 
+    if total_mass <= 0:
+        mean_speed = 0.0
+        mean_radius = 0.0
+    else:
+        mean_speed = float(speed_mass_sum / total_mass)
+        mean_radius = float(radius_mass_sum / total_mass)
+
     return {
         "kinetic_allreduce": float(kinetic),
         "total_mass": float(total_mass),
-        "mean_speed_allreduce": float(speed_mass_sum / total_mass) if total_mass > 0 else 0.0,
-        "mean_radius_allreduce": float(radius_mass_sum / total_mass) if total_mass > 0 else 0.0,
+        "mean_speed_allreduce": mean_speed,
+        "mean_radius_allreduce": mean_radius,
         "max_radius_allreduce": float(max_radius),
         "angular_momentum_norm_allreduce": float(np.linalg.norm(angular)),
     }

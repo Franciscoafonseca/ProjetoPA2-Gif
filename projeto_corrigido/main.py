@@ -2,27 +2,23 @@
 """
 main.py
 
-This is the entry point that joins all grading-oriented modules:
-- physical_correctness.py
-- mpi_parallelization.py
-- runtime_measurement.py
-- gif_visualization.py
+Entrada principal do projeto PA2 — Simulação Paralela de Galáxia.
 
-Recommended execution:
+Execuções recomendadas dentro de:
+C:\\Projetos\\Pa\\ProjetoPA2-Gif\\projeto_corrigido>
 
-1) Beautiful physical N-body GIF with many frames:
-   mpiexec -n 4 python main.py --particles 1500 --years 10000 --dt 25 --plot-interval 250 --mode beauty
+1) GIF bonito, suave e com mais frames:
+   mpiexec -n 4 python main.py --mode beauty --particles 2200 --years 12000 --dt 20 --plot-interval 200
 
-2) More literal assignment mode, plot every 1000 simulated years:
-   mpiexec -n 4 python main.py --particles 1200 --years 10000 --dt 25 --plot-interval 1000 --mode report
+2) Modo fiel ao enunciado, frame a cada 1000 anos:
+   mpiexec -n 4 python main.py --mode report --particles 1800 --years 10000 --dt 25 --plot-interval 1000
 
-3) 10^8 representative GIF without direct N-body execution:
-   mpiexec -n 4 python main.py --particles 100000000 --years 1000000000 --scale-gif --scale-sample-particles 300000 --scale-frames 120
+3) Benchmark sem GIF, para medições de runtime:
+   mpiexec -n 4 python main.py --mode benchmark --particles 2500 --years 5000 --dt 25
 
-4) 10^9 representative GIF without direct N-body execution:
-   mpiexec -n 4 python main.py --particles 1000000000 --years 1000000000 --scale-gif --scale-sample-particles 300000 --scale-frames 120
+4) Proxy visual para escala 10^9 sem executar O(N^2):
+   mpiexec -n 4 python main.py --scale-gif --particles 1000000000 --years 1000000000 --scale-sample-particles 250000 --scale-frames 140
 """
-
 from __future__ import annotations
 
 import argparse
@@ -35,27 +31,6 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from physical_correctness import (
-    create_initial_conditions,
-    local_basic_diagnostics,
-    snapshot_energy_diagnostics,
-)
-from mpi_parallelization import (
-    allreduce_basic_diagnostics,
-    bcast_config,
-    compute_acceleration_ring,
-    gather_snapshot,
-    get_mpi,
-    partition_counts,
-    scatter_particles,
-    split_particle_chunks,
-)
-from runtime_measurement import (
-    TimerBook,
-    estimate_direct_nbody_cost,
-    write_csv_semicolon,
-    write_runtime_summary,
-)
 from gif_visualization import (
     create_gif,
     generate_scale_rank_sample,
@@ -63,238 +38,267 @@ from gif_visualization import (
     render_direct_frame,
     render_scale_frame,
 )
+from mpi_parallelization import (
+    allreduce_basic_diagnostics,
+    bcast_config,
+    compute_acceleration_ring,
+    create_local_particles,
+    get_mpi,
+    partition_counts,
+    gather_snapshot,
+)
+from physical_correctness import local_basic_diagnostics, snapshot_energy_diagnostics
+from runtime_measurement import (
+    TimerBook,
+    estimate_direct_nbody_cost,
+    write_csv_semicolon,
+    write_runtime_summary,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Modular MPI galaxy simulation for PA Project 2.")
+    p = argparse.ArgumentParser(description="Parallel galaxy simulation with mpi4py, Newtonian gravity and GIF output.")
 
-    # Core physical simulation.
-    p.add_argument("--particles", type=int, default=1500, help="Number of particles for direct N-body mode, or represented particles for --scale-gif.")
-    p.add_argument("--years", type=float, default=10000.0, help="Total simulated/displayed years.")
-    p.add_argument("--dt", type=float, default=25.0, help="Time step in simulated years for direct N-body mode.")
-    p.add_argument("--plot-interval", type=float, default=250.0, help="Years between frames. Use 1000 for the strict assignment wording.")
-    p.add_argument("--galaxy-radius", type=float, default=120.0)
-    p.add_argument("--thickness", type=float, default=7.0)
+    # Simulação física.
+    p.add_argument("--particles", type=int, default=2200, help="Número de partículas no modo físico direto.")
+    p.add_argument("--years", type=float, default=12000.0, help="Anos simulados.")
+    p.add_argument("--dt", type=float, default=20.0, help="Passo temporal em anos simulados.")
+    p.add_argument("--plot-interval", type=float, default=200.0, help="Intervalo entre frames. Usa 1000 para modo enunciado.")
+    p.add_argument("--g-const", type=float, default=2.15e-9)
+    p.add_argument("--central-mass", type=float, default=2.25e8)
+    p.add_argument("--disk-mass-proxy", type=float, default=6.0e7)
+    p.add_argument("--softening", type=float, default=9.0)
+    p.add_argument("--pair-block", type=int, default=384, help="Bloco vetorizado do cálculo de forças.")
+    p.add_argument("--energy-sample-limit", type=int, default=2500)
+
+    # Estrutura galáctica.
+    p.add_argument("--galaxy-radius", type=float, default=125.0)
+    p.add_argument("--thickness", type=float, default=6.5)
     p.add_argument("--spiral-arms", type=int, default=4)
-    p.add_argument("--arm-twist", type=float, default=4.8)
-    p.add_argument("--halo-fraction", type=float, default=0.10)
-    p.add_argument("--g-const", type=float, default=2.0e-9)
-    p.add_argument("--central-mass", type=float, default=1.8e8)
-    p.add_argument("--softening", type=float, default=10.0)
-    p.add_argument("--rotation-factor", type=float, default=0.82)
-    p.add_argument("--velocity-noise", type=float, default=0.0030)
-    p.add_argument("--pair-block", type=int, default=512)
-    p.add_argument("--energy-sample-limit", type=int, default=5000, help="Exact potential energy up to this many particles; sampled estimate above it.")
+    p.add_argument("--arm-twist", type=float, default=4.9)
+    p.add_argument("--arm-width", type=float, default=0.115)
+    p.add_argument("--bar-fraction", type=float, default=0.18)
+    p.add_argument("--bulge-fraction", type=float, default=0.085)
+    p.add_argument("--halo-fraction", type=float, default=0.085)
+    p.add_argument("--halo-radius-factor", type=float, default=1.30)
+    p.add_argument("--rotation-factor", type=float, default=0.88)
+    p.add_argument("--mass-log-mean", type=float, default=6.12)
+    p.add_argument("--mass-log-sigma", type=float, default=0.38)
+    p.add_argument("--velocity-noise", type=float, default=0.0016)
+    p.add_argument("--radial-velocity-noise", type=float, default=0.0022)
+    p.add_argument("--vertical-velocity-noise", type=float, default=0.0012)
+    p.add_argument("--bulge-velocity-noise", type=float, default=0.006)
+    p.add_argument("--halo-velocity-noise", type=float, default=0.004)
 
-    # Output and visual settings.
+    # Visualização.
     p.add_argument("--output-dir", type=str, default="galaxy_modular_output")
-    p.add_argument("--gif-name", type=str, default="galaxy_physical.gif")
-    p.add_argument("--fps", type=int, default=14)
-    p.add_argument("--dpi", type=int, default=125)
-    p.add_argument("--fig-width", type=float, default=15.5)
-    p.add_argument("--fig-height", type=float, default=7.8)
-    p.add_argument("--density-bins", type=int, default=300)
-    p.add_argument("--max-3d-points", type=int, default=15000)
-    p.add_argument("--trail-length", type=int, default=18)
-    p.add_argument("--background-stars", type=int, default=900)
+    p.add_argument("--gif-name", type=str, default="galaxy_physical_smooth.gif")
+    p.add_argument("--fps", type=int, default=18)
+    p.add_argument("--dpi", type=int, default=130)
+    p.add_argument("--fig-width", type=float, default=15.8)
+    p.add_argument("--fig-height", type=float, default=7.9)
+    p.add_argument("--density-bins", type=int, default=340)
+    p.add_argument("--max-2d-points", type=int, default=48000)
+    p.add_argument("--max-3d-points", type=int, default=18000)
+    p.add_argument("--trail-length", type=int, default=24)
+    p.add_argument("--trail-particles", type=int, default=220)
+    p.add_argument("--background-stars", type=int, default=1300)
     p.add_argument("--keep-frames", action="store_true")
     p.add_argument("--no-gif", action="store_true")
-    p.add_argument("--no-plot", action="store_true", help="Run physics and CSV only; no frames/GIF.")
+    p.add_argument("--no-plot", action="store_true")
 
-    # Presets.
-    p.add_argument("--mode", choices=["custom", "report", "beauty", "benchmark"], default="beauty")
+    # Presets e execução.
+    p.add_argument("--mode", choices=["custom", "beauty", "report", "benchmark"], default="beauty")
     p.add_argument("--seed", type=int, default=2120622)
-    p.add_argument("--allow-serial", action="store_true", help="Allow running without mpi4py, useful for preview/debug.")
+    p.add_argument("--allow-serial", action="store_true", help="Permite testar sem MPI real. Não usar na entrega final.")
 
-    # Scale GIF / feasibility mode.
-    p.add_argument("--scale-gif", action="store_true", help="Generate representative weighted-density GIF for huge N without direct N-body execution.")
-    p.add_argument("--scale-sample-particles", type=int, default=300000, help="Actual sampled points used to represent all particles in --scale-gif.")
-    p.add_argument("--scale-frames", type=int, default=120)
-    p.add_argument("--scale-gif-name", type=str, default="galaxy_scale_proxy_all_particles.gif")
-    p.add_argument("--scale-overlay-points", type=int, default=14000)
-    p.add_argument("--scale-only", action="store_true", help="Only write feasibility estimates; no physical simulation and no GIF.")
-    p.add_argument("--calibration-rate", type=float, default=6.68e7, help="Estimated pair interactions per second for runtime extrapolation.")
+    # Proxy de escala para 10^8/10^9.
+    p.add_argument("--scale-gif", action="store_true")
+    p.add_argument("--scale-only", action="store_true")
+    p.add_argument("--scale-sample-particles", type=int, default=250000)
+    p.add_argument("--scale-frames", type=int, default=140)
+    p.add_argument("--scale-gif-name", type=str, default="galaxy_scale_proxy_1e9.gif")
+    p.add_argument("--calibration-rate", type=float, default=6.5e7, help="Interações par/segundo por rank para estimativa O(N^2).")
 
     return p.parse_args()
 
 
 def apply_mode_presets(args: argparse.Namespace) -> None:
-    """High-level presets. CLI values can still be overridden by editing command arguments."""
-    if args.mode == "report":
+    """Presets para não ter de escrever muitos parâmetros nos testes."""
+    if args.mode == "beauty":
+        # Mais frames e visual mais suave que o enunciado estrito.
+        args.plot_interval = min(float(args.plot_interval), 200.0)
+        args.dt = min(float(args.dt), 20.0)
+        args.fps = max(int(args.fps), 18)
+        args.trail_length = max(int(args.trail_length), 24)
+        args.trail_particles = max(int(args.trail_particles), 220)
+        args.density_bins = max(int(args.density_bins), 340)
+        args.max_3d_points = max(int(args.max_3d_points), 18000)
+        args.arm_width = min(float(args.arm_width), 0.12)
+        args.softening = max(float(args.softening), 9.0)
+    elif args.mode == "report":
+        # Fiel à frase do enunciado: plot de 1000 em 1000 anos.
         args.plot_interval = 1000.0
-        args.fps = min(args.fps, 10)
-        args.trail_length = min(args.trail_length, 12)
-        args.density_bins = min(args.density_bins, 260)
-    elif args.mode == "beauty":
-        # More frames and smoother GIF than the strict assignment mode.
-        args.plot_interval = min(args.plot_interval, 250.0)
-        args.fps = max(args.fps, 14)
-        args.trail_length = max(args.trail_length, 18)
-        args.density_bins = max(args.density_bins, 300)
-        args.max_3d_points = max(args.max_3d_points, 15000)
-        args.softening = max(args.softening, 10.0)
+        args.fps = min(int(args.fps), 12)
+        args.trail_length = min(int(args.trail_length), 14)
+        args.density_bins = min(int(args.density_bins), 280)
     elif args.mode == "benchmark":
-        args.no_gif = True
         args.no_plot = True
-        args.plot_interval = max(args.plot_interval, 1000.0)
-        args.background_stars = min(args.background_stars, 150)
-        args.dpi = min(args.dpi, 95)
+        args.no_gif = True
+        args.plot_interval = max(float(args.plot_interval), 1000.0)
+        args.density_bins = min(int(args.density_bins), 160)
+        args.background_stars = min(int(args.background_stars), 150)
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.particles <= 0:
-        raise SystemExit("--particles must be positive")
-    if args.years <= 0:
-        raise SystemExit("--years must be positive")
-    if args.dt <= 0:
-        raise SystemExit("--dt must be positive")
-    if args.plot_interval <= 0:
-        raise SystemExit("--plot-interval must be positive")
-    if args.scale_sample_particles <= 0:
-        raise SystemExit("--scale-sample-particles must be positive")
-    if args.scale_frames < 2:
-        raise SystemExit("--scale-frames must be at least 2")
+    checks = [
+        (args.particles > 0, "--particles tem de ser positivo"),
+        (args.years > 0, "--years tem de ser positivo"),
+        (args.dt > 0, "--dt tem de ser positivo"),
+        (args.plot_interval > 0, "--plot-interval tem de ser positivo"),
+        (args.spiral_arms >= 1, "--spiral-arms tem de ser >= 1"),
+        (args.scale_sample_particles > 0, "--scale-sample-particles tem de ser positivo"),
+        (args.scale_frames >= 2, "--scale-frames tem de ser >= 2"),
+    ]
+    for ok, msg in checks:
+        if not ok:
+            raise SystemExit(msg)
 
 
 def run_scale_estimate_only(args: argparse.Namespace, rank: int, size: int, out_dir: Path) -> None:
     estimate = estimate_direct_nbody_cost(args.particles, args.years, args.dt, size, args.calibration_rate)
     if rank == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
         write_csv_semicolon(out_dir / "scale_estimate.csv", [estimate])
-        print("=== Scale-only estimate ===")
-        print(f"Particles: {args.particles:,}")
-        print(f"Total interactions: {estimate['total_interactions']:.3e}")
-        print(f"Estimated direct runtime: {estimate['estimated_runtime_human']}")
+        print("=== Estimativa O(N^2) para escala real ===")
+        print(f"Partículas: {args.particles:,}")
+        print(f"Passos: {estimate['steps']}")
+        print(f"Interações totais: {estimate['total_interactions']}")
+        print(f"Runtime estimado: {estimate['estimated_runtime_human']}")
         print(f"CSV: {out_dir / 'scale_estimate.csv'}")
 
 
 def run_scale_gif(args: argparse.Namespace, MPI: Any, comm: Any, rank: int, size: int, out_dir: Path) -> None:
-    """Generate the 10^8 / 10^9 representative GIF without direct N-body execution."""
-    import time
-
+    """GIF proxy para N enorme sem executar N-body direto."""
     frames_dir = out_dir / "frames_scale_proxy"
     if rank == 0:
         if frames_dir.exists():
             shutil.rmtree(frames_dir)
         frames_dir.mkdir(parents=True, exist_ok=True)
 
-    counts = partition_counts(int(args.scale_sample_particles), size)
-    local_n = counts[rank]
-
+    counts = partition_counts(int(args.scale_sample_particles), int(size))
+    local_n = counts[int(rank)]
     comm.Barrier()
     start = time.perf_counter()
+
     local_sample = generate_scale_rank_sample(local_n, args, rank)
     local_count = int(local_sample["r"].shape[0])
     total_sample = comm.reduce(local_count, op=MPI.SUM, root=0)
-
     estimate = estimate_direct_nbody_cost(args.particles, args.years, args.dt, size, args.calibration_rate)
-    frame_paths: List[Path] = []
-    frame_records: List[Dict[str, Any]] = []
 
     if rank == 0:
-        print("=== Scale GIF mode ===")
-        print(f"Represented particles: {args.particles:,}")
-        print(f"Visual sample: {args.scale_sample_particles:,} | ranks: {size} | sample counts: {counts}")
-        print("This creates a weighted density GIF. It does not run direct O(N^2) N-body physics.")
+        print("=== Modo scale-gif / proxy visual ===")
+        print(f"Partículas representadas: {args.particles:,}")
+        print(f"Amostra desenhada: {int(total_sample):,} | ranks: {size} | frames: {args.scale_frames}")
+        print("Nota: este modo NÃO executa N-body O(N^2); é para visualização e discussão de escala.")
 
+    frame_paths: List[Path] = []
+    frame_records: List[Dict[str, Any]] = []
     for frame_idx in range(int(args.scale_frames)):
         gathered = comm.gather(local_sample, root=0)
         if rank == 0:
             frame_path = frames_dir / f"scale_frame_{frame_idx:04d}.png"
-            rec = render_scale_frame(
-                gathered,
-                frame_path,
-                frame_idx,
-                int(args.scale_frames),
-                args,
-                size,
-                int(args.particles),
-            )
-            frame_records.append(rec)
+            rec = render_scale_frame(gathered, frame_path, frame_idx, int(args.scale_frames), args, size, int(args.particles))
             frame_paths.append(frame_path)
+            frame_records.append(rec)
             print(f"Scale frame {frame_idx + 1:03d}/{args.scale_frames}")
+        comm.Barrier()
 
-    comm.Barrier()
     runtime_without_gif = time.perf_counter() - start
-
     if rank == 0:
         gif_start = time.perf_counter()
         gif_path = out_dir / args.scale_gif_name
-        create_gif(frame_paths, gif_path, args.fps)
+        create_gif(frame_paths, gif_path, int(args.fps))
         gif_time = time.perf_counter() - gif_start
         total_runtime = runtime_without_gif + gif_time
 
         summary = {
             "mode": "scale_gif_weighted_density_proxy",
-            "represented_particles": args.particles,
-            "visual_sample_particles": total_sample,
-            "mpi_ranks": size,
-            "frames": args.scale_frames,
-            "fps": args.fps,
+            "represented_particles": int(args.particles),
+            "visual_sample_particles": int(total_sample),
+            "mpi_ranks": int(size),
+            "frames": int(args.scale_frames),
+            "fps": int(args.fps),
             "gif_path": str(gif_path),
             "runtime_without_gif_seconds": f"{runtime_without_gif:.6f}",
             "gif_creation_seconds": f"{gif_time:.6f}",
             "total_runtime_seconds": f"{total_runtime:.6f}",
-            "important_note": "GIF represents all particles by weighted density; no direct O(N^2) N-body execution was performed.",
+            "important_note": "Proxy visual ponderada; não é simulação direta O(N^2).",
         }
         summary.update({f"estimate_{k}": v for k, v in estimate.items()})
         write_csv_semicolon(out_dir / "runtime_summary.csv", [summary])
         write_csv_semicolon(out_dir / "frame_results.csv", frame_records)
         print(f"GIF: {gif_path}")
-        print(f"CSV summary: {out_dir / 'runtime_summary.csv'}")
-        print(f"CSV frames: {out_dir / 'frame_results.csv'}")
+        print(f"CSV runtime: {out_dir / 'runtime_summary.csv'}")
         if not args.keep_frames:
             shutil.rmtree(frames_dir, ignore_errors=True)
 
 
-def run_direct_physics(args: argparse.Namespace, MPI: Any, comm: Any, rank: int, size: int, out_dir: Path, serial_fallback: bool) -> None:
-    """Run the real Newtonian direct N-body simulation."""
+def run_direct_physics(
+    args: argparse.Namespace,
+    MPI: Any,
+    comm: Any,
+    rank: int,
+    size: int,
+    out_dir: Path,
+    serial_fallback: bool,
+) -> None:
+    """Executa a simulação N-body direta com MPI."""
     timers = TimerBook()
 
+    frames_dir = out_dir / "frames_direct_physics"
     if rank == 0:
-        frames_dir = out_dir / "frames_direct_physics"
         if frames_dir.exists():
             shutil.rmtree(frames_dir)
         frames_dir.mkdir(parents=True, exist_ok=True)
-        ids, pos, vel, mass = create_initial_conditions(args)
-        chunks = split_particle_chunks(ids, pos, vel, mass, size)
-    else:
-        frames_dir = None
-        chunks = None
 
-    local = scatter_particles(comm, chunks)
+    # scatter() dos IDs + geração paralela local das partículas.
+    t_init = time.perf_counter()
+    local = create_local_particles(comm, rank, size, args)
+    timers.add("initial_conditions", time.perf_counter() - t_init)
+
     counts = comm.allgather(int(len(local["ids"])))
     total_checked = comm.reduce(int(len(local["ids"])), op=MPI.SUM, root=0)
 
     if rank == 0:
-        print("=== Direct physical N-body mode ===")
-        print(f"Particles: {args.particles:,} | MPI ranks: {size} | counts per rank: {counts}")
-        print(f"reduce() particle check: {total_checked}")
-        print("MPI methods: bcast, scatter, allgather, isend/irecv, gather, reduce, allreduce, Barrier")
-        print("Integrator: Leapfrog / velocity-Verlet")
+        print("=== Simulação física direta N-body ===")
+        print(f"Partículas: {args.particles:,} | ranks MPI: {size} | distribuição: {counts}")
+        print(f"Validação reduce(): {total_checked:,} partículas")
+        print("MPI: bcast, scatter, allgather, isend/irecv, gather, reduce, allreduce, Barrier")
+        print(f"Frames previstos: ~{math.floor(args.years / args.plot_interval) + 1}")
         if serial_fallback:
-            print("Serial fallback active: mpi4py was not used.")
+            print("AVISO: fallback serial ativo; não usar isto na entrega final.")
 
     steps = int(math.ceil(float(args.years) / float(args.dt)))
     plot_every_steps = max(1, int(round(float(args.plot_interval) / float(args.dt))))
-    frame_count_estimate = (steps // plot_every_steps) + 1
+    frame_count_estimate = int(math.floor(steps / plot_every_steps)) + 1
     if steps % plot_every_steps != 0:
         frame_count_estimate += 1
 
-    history: deque = deque(maxlen=max(1, int(args.trail_length) + 1)) if rank == 0 else deque(maxlen=1)
-    background = make_background(int(args.seed), int(args.background_stars), float(args.galaxy_radius) * 1.45) if rank == 0 and not args.no_plot else None
-    frame_paths: List[Path] = []
-    frame_records: List[Dict[str, Any]] = []
-    initial_energy = None
-    frame_number = 0
+    history: deque = deque(maxlen=max(1, int(args.trail_length) + 1))
+    background = make_background(int(args.seed), int(args.background_stars), float(args.galaxy_radius) * 1.45) if rank == 0 else None
 
     comm.Barrier()
     total_start = time.perf_counter()
 
-    # Initial acceleration.
     acc = compute_acceleration_ring(comm, rank, size, local["pos"], local["mass"], args, timers.values)
+    initial_energy: float | None = None
+    frame_paths: List[Path] = []
+    frame_records: List[Dict[str, Any]] = []
+    frame_number = 0
 
     for step in range(steps + 1):
-        current_year = min(step * float(args.dt), float(args.years))
+        current_year = min(float(step) * float(args.dt), float(args.years))
         should_plot = (step % plot_every_steps == 0) or (step == steps)
 
         if should_plot:
@@ -302,18 +306,20 @@ def run_direct_physics(args: argparse.Namespace, MPI: Any, comm: Any, rank: int,
             local_diag = local_basic_diagnostics(local["pos"], local["vel"], local["mass"])
             reduced_diag = allreduce_basic_diagnostics(comm, MPI, local_diag)
             snapshot = gather_snapshot(comm, local, root=0)
-            timers.add("diagnostics", time.perf_counter() - t_diag)
+            timers.add("diagnostics_and_gather", time.perf_counter() - t_diag)
 
             if rank == 0 and snapshot is not None:
-                t_energy = time.perf_counter()
+                energy_start = time.perf_counter()
                 energy_diag = snapshot_energy_diagnostics(snapshot, args)
-                timers.add("diagnostics", time.perf_counter() - t_energy)
+                timers.add("energy_diagnostics", time.perf_counter() - energy_start)
+
                 if initial_energy is None:
-                    initial_energy = energy_diag["total_energy"]
+                    initial_energy = float(energy_diag["total_energy"])
                 if initial_energy is not None and abs(initial_energy) > 1e-30:
-                    energy_diag["energy_drift_percent"] = 100.0 * (energy_diag["total_energy"] - initial_energy) / abs(initial_energy)
+                    drift = 100.0 * (float(energy_diag["total_energy"]) - initial_energy) / abs(initial_energy)
                 else:
-                    energy_diag["energy_drift_percent"] = 0.0
+                    drift = 0.0
+                energy_diag["energy_drift_percent"] = float(drift)
                 energy_diag.update(reduced_diag)
 
                 history.append({"pos": snapshot["pos"].copy()})
@@ -323,7 +329,7 @@ def run_direct_physics(args: argparse.Namespace, MPI: Any, comm: Any, rank: int,
                     frame_path = frames_dir / f"frame_{frame_number:04d}.png"
                     render_direct_frame(
                         snapshot,
-                        history,
+                        list(history),
                         frame_path,
                         current_year,
                         frame_number,
@@ -337,11 +343,11 @@ def run_direct_physics(args: argparse.Namespace, MPI: Any, comm: Any, rank: int,
                     frame_paths.append(frame_path)
 
                 rec = {
-                    "frame": frame_number,
-                    "step": step,
+                    "frame": int(frame_number),
+                    "step": int(step),
                     "year": f"{current_year:.6f}",
-                    "particles": args.particles,
-                    "mpi_ranks": size,
+                    "particles": int(args.particles),
+                    "mpi_ranks": int(size),
                     "kinetic": f"{energy_diag['kinetic']:.12e}",
                     "potential": f"{energy_diag['potential']:.12e}",
                     "total_energy": f"{energy_diag['total_energy']:.12e}",
@@ -354,13 +360,17 @@ def run_direct_physics(args: argparse.Namespace, MPI: Any, comm: Any, rank: int,
                     "potential_is_estimated": int(energy_diag.get("potential_is_estimated", 0.0)),
                 }
                 frame_records.append(rec)
-                print(f"Frame {frame_number + 1:03d} | year={current_year:,.0f} | E drift={energy_diag['energy_drift_percent']:+.3f}%")
+                print(
+                    f"Frame {frame_number + 1:03d}/{frame_count_estimate} | "
+                    f"ano={current_year:,.0f} | drift energia={energy_diag['energy_drift_percent']:+.3f}%"
+                )
                 frame_number += 1
 
         if step == steps:
             break
 
-        # Leapfrog / velocity-Verlet update.
+        # Integrador Leapfrog / velocity-Verlet:
+        # v(t+dt/2), x(t+dt), a(t+dt), v(t+dt)
         half_dt = 0.5 * float(args.dt)
         local["vel"] += half_dt * acc
         local["pos"] += float(args.dt) * local["vel"]
@@ -374,33 +384,35 @@ def run_direct_physics(args: argparse.Namespace, MPI: Any, comm: Any, rank: int,
 
     if rank == 0:
         gif_path = out_dir / args.gif_name
-        gif_time = 0.0
         if frame_paths and not args.no_gif and not args.no_plot:
             t_gif = time.perf_counter()
             create_gif(frame_paths, gif_path, int(args.fps))
-            gif_time = time.perf_counter() - t_gif
-            timers.add("gif", gif_time)
-            timers.values["total"] += gif_time
+            gif_seconds = time.perf_counter() - t_gif
+            timers.add("gif_creation", gif_seconds)
+            timers.values["total"] += gif_seconds
+        else:
+            gif_path = Path("not_generated")
 
         summary_extra = {
-            "mpi_ranks": size,
-            "particle_counts_per_rank": counts,
-            "total_particles_reduce_check": total_checked,
-            "steps": steps,
-            "frames": frame_number,
-            "actual_plot_interval_years": plot_every_steps * float(args.dt),
-            "csv_delimiter": ";",
-            "gif_path": str(gif_path) if frame_paths and not args.no_gif and not args.no_plot else "not_generated",
-            "physics_model": "direct Newtonian all-pairs N-body with softening and central mass",
+            "mpi_ranks": int(size),
+            "particle_counts_per_rank": str(counts),
+            "total_particles_reduce_check": int(total_checked),
+            "steps": int(steps),
+            "frames": int(frame_number),
+            "actual_plot_interval_years": float(plot_every_steps) * float(args.dt),
+            "gif_path": str(out_dir / args.gif_name) if frame_paths and not args.no_gif and not args.no_plot else "not_generated",
+            "physics_model": "Newtonian all-pairs N-body with gravitational softening and central mass",
             "integrator": "Leapfrog / velocity-Verlet",
-            "mpi_methods": "bcast;scatter;allgather;isend;irecv;gather;reduce;allreduce;Barrier",
+            "mpi_methods": "bcast; scatter; allgather; isend; irecv; gather; reduce; allreduce; Barrier",
+            "csv_delimiter": ";",
         }
         write_runtime_summary(out_dir / "runtime_summary.csv", args, summary_extra, timers.as_dict())
         write_csv_semicolon(out_dir / "frame_results.csv", frame_records)
+
         print(f"Runtime CSV: {out_dir / 'runtime_summary.csv'}")
         print(f"Frame CSV: {out_dir / 'frame_results.csv'}")
         if frame_paths and not args.no_gif and not args.no_plot:
-            print(f"GIF: {gif_path}")
+            print(f"GIF: {out_dir / args.gif_name}")
         if not args.keep_frames and not args.no_plot:
             shutil.rmtree(frames_dir, ignore_errors=True)
 
@@ -411,10 +423,10 @@ def main() -> None:
     validate_args(args)
 
     MPI, comm, serial_fallback = get_mpi(args.allow_serial)
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    rank = int(comm.Get_rank())
+    size = int(comm.Get_size())
 
-    # bcast: all ranks receive exactly the same configuration.
+    # bcast() garante que todos os processos usam exatamente os mesmos parâmetros.
     args = bcast_config(comm, rank, args)
 
     out_dir = Path(args.output_dir)

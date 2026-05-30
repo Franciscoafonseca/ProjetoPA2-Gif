@@ -2,19 +2,14 @@
 """
 physical_correctness.py
 
-Criterion covered: Physical correctness.
+Modelo físico da simulação de galáxia para PA Project 2.
 
-This module contains the physics of the galaxy simulation:
-- Newtonian gravity: F = G m1 m2 / r^2 and a = F / m.
-- Gravitational softening to avoid numerical singularities at very small distances.
-- Physically meaningful initial conditions: disk + halo, masses, tangential orbital velocities.
-- Leapfrog / velocity-Verlet integration support.
-- Energy and orbital diagnostics for the report.
-
-The MPI communication is intentionally NOT here. This file is about the model and the
-mathematics only, so it is easier to explain in the report under "Physical correctness".
+O objetivo deste ficheiro é manter a física separada do MPI:
+- geração de condições iniciais com disco espiral, bojo central e halo;
+- massa, posição e velocidade inicial de cada estrela;
+- aceleração gravitacional newtoniana com softening;
+- diagnósticos físicos para o relatório.
 """
-
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -24,88 +19,128 @@ import numpy as np
 Array = np.ndarray
 
 
-def create_initial_conditions(args) -> Tuple[Array, Array, Array, Array]:
-    """Create a galaxy on rank 0 before MPI scatter.
+def _rng_for_rank(seed: int, rank: int) -> np.random.Generator:
+    """Gerador independente por rank, reprodutível para testes."""
+    return np.random.default_rng(int(seed) + 1009 * int(rank) + 9176)
 
-    Each star has:
-    - id: stable particle identifier;
-    - pos: 3D position;
-    - vel: 3D velocity;
-    - mass: scalar mass.
 
-    Distribution choices used for the report:
-    - disk radii follow a gamma-like distribution for a dense core and extended disk;
-    - halo particles are sampled from a diffuse spherical distribution;
-    - stellar masses follow a log-normal distribution;
-    - initial velocities are tangential and approximately circular around the centre.
+def generate_local_initial_conditions(
+    ids: Array,
+    args,
+    rank: int = 0,
+) -> Tuple[Array, Array, Array, Array]:
     """
-    rng = np.random.default_rng(int(args.seed))
-    n = int(args.particles)
-    ids = np.arange(n, dtype=np.int64)
+    Gera apenas as partículas locais deste rank.
 
-    # Log-normal masses: many lighter stars and a few heavier bodies.
-    mass = rng.lognormal(mean=6.15, sigma=0.38, size=n).astype(np.float64)
+    Isto torna a geração inicial paralela: o rank 0 só distribui os IDs por scatter(),
+    e cada processo cria o seu bloco usando distribuições estatísticas.
 
-    halo_fraction = float(np.clip(args.halo_fraction, 0.0, 0.45))
-    is_halo = rng.random(n) < halo_fraction
-    is_disk = ~is_halo
-    n_disk = int(np.count_nonzero(is_disk))
-    n_halo = n - n_disk
+    Estrutura da galáxia:
+    - disco fino com braços espirais logarítmicos;
+    - bojo central mais denso;
+    - halo 3D difuso;
+    - velocidades tangenciais aproximadas para órbitas quase circulares.
+    """
+    ids = np.asarray(ids, dtype=np.int64)
+    n = int(ids.size)
+    rng = _rng_for_rank(int(args.seed), rank)
 
-    r = np.empty(n, dtype=np.float64)
-    theta = np.empty(n, dtype=np.float64)
-    z = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return ids, np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0)
 
-    # Disk: spiral arms with a concentrated core and extended tails.
-    r_disk = rng.gamma(shape=2.0, scale=float(args.galaxy_radius) / 5.2, size=n_disk)
-    r_disk = np.clip(r_disk, 0.5, float(args.galaxy_radius))
-    arm = rng.integers(0, max(1, int(args.spiral_arms)), size=n_disk)
-    base_theta = 2.0 * np.pi * arm / max(1, int(args.spiral_arms))
-    theta_disk = base_theta + float(args.arm_twist) * (r_disk / float(args.galaxy_radius))
-    theta_disk += rng.normal(0.0, 0.14 + 0.005 * r_disk, size=n_disk)
-    z_disk = rng.normal(
-        0.0,
-        float(args.thickness) * (0.22 + 0.78 * r_disk / float(args.galaxy_radius)),
-        size=n_disk,
-    )
+    radius = float(args.galaxy_radius)
+    thickness = float(args.thickness)
+    arms = max(1, int(args.spiral_arms))
 
-    # Halo: less dense 3D population around the disk.
-    if n_halo > 0:
-        r_halo = float(args.galaxy_radius) * (rng.random(n_halo) ** (1.0 / 3.0))
-        cos_phi = rng.uniform(-1.0, 1.0, size=n_halo)
-        theta_halo = rng.uniform(0.0, 2.0 * np.pi, size=n_halo)
-        r_halo_xy = r_halo * np.sqrt(np.maximum(0.0, 1.0 - cos_phi * cos_phi))
-        z_halo = r_halo * cos_phi * 0.70
-    else:
-        r_halo_xy = np.empty(0, dtype=np.float64)
-        theta_halo = np.empty(0, dtype=np.float64)
-        z_halo = np.empty(0, dtype=np.float64)
+    # Tipos de estrela/partícula. As probabilidades criam disco dominante,
+    # bojo visível e halo pouco denso.
+    u = rng.random(n)
+    is_bulge = u < float(args.bulge_fraction)
+    is_halo = (u >= float(args.bulge_fraction)) & (u < float(args.bulge_fraction) + float(args.halo_fraction))
+    is_disk = ~(is_bulge | is_halo)
 
-    r[is_disk] = r_disk
-    theta[is_disk] = theta_disk
-    z[is_disk] = z_disk
-    r[is_halo] = r_halo_xy
-    theta[is_halo] = theta_halo
-    z[is_halo] = z_halo
+    pos = np.zeros((n, 3), dtype=np.float64)
+    vel = np.zeros((n, 3), dtype=np.float64)
 
-    x = r * np.cos(theta)
-    y = r * np.sin(theta)
-    pos = np.column_stack([x, y, z]).astype(np.float64)
+    # Massas log-normais: muitas estrelas leves e algumas mais pesadas.
+    mass = rng.lognormal(mean=float(args.mass_log_mean), sigma=float(args.mass_log_sigma), size=n)
+    mass = mass.astype(np.float64)
 
-    # Approximate circular velocities around the central mass.
-    radius_3d = np.linalg.norm(pos, axis=1) + float(args.softening)
-    enclosed_fraction = np.clip(radius_3d / max(float(args.galaxy_radius), 1e-12), 0.0, 1.0)
-    enclosed_mass = float(args.central_mass) + np.sum(mass) * enclosed_fraction
-    circular_speed = np.sqrt(float(args.g_const) * enclosed_mass / radius_3d) * float(args.rotation_factor)
+    # -----------------------------
+    # Disco espiral
+    # -----------------------------
+    nd = int(np.count_nonzero(is_disk))
+    if nd:
+        # Gamma cria centro denso e cauda externa, mais parecido com disco galáctico.
+        r = rng.gamma(shape=2.25, scale=radius / 6.2, size=nd)
+        r = np.clip(r, 0.45, radius)
 
-    tangential = np.column_stack([-np.sin(theta), np.cos(theta), np.zeros(n, dtype=np.float64)])
-    vel = tangential * circular_speed[:, None]
+        arm = rng.integers(0, arms, size=nd)
+        arm_angle = (2.0 * np.pi * arm) / arms
+
+        # Espiral logarítmica/diferencial. Menos ruído no centro, mais difuso fora.
+        arm_width = float(args.arm_width)
+        twist = float(args.arm_twist)
+        theta = arm_angle + twist * np.log1p(r / max(radius * 0.08, 1e-9))
+        theta += rng.normal(0.0, arm_width * (0.55 + 0.85 * r / radius), size=nd)
+
+        # Barra central suave, ajuda a imagem parecer uma galáxia estruturada.
+        bar_mask = r < radius * float(args.bar_fraction)
+        if np.any(bar_mask):
+            theta[bar_mask] = rng.normal(0.0, 0.28, size=int(np.count_nonzero(bar_mask)))
+            theta[bar_mask] += rng.choice([0.0, np.pi], size=int(np.count_nonzero(bar_mask)))
+
+        z = rng.normal(0.0, thickness * (0.18 + 0.75 * r / radius), size=nd)
+
+        x = r * np.cos(theta)
+        y = r * np.sin(theta)
+        pos[is_disk, 0] = x
+        pos[is_disk, 1] = y
+        pos[is_disk, 2] = z
+
+        # Velocidade orbital aproximada: v = sqrt(G*M(<r)/r).
+        enclosed = float(args.central_mass) + float(args.disk_mass_proxy) * (r / radius) ** 1.55
+        v_circ = np.sqrt(float(args.g_const) * enclosed / np.maximum(r, float(args.softening)))
+        v_circ *= float(args.rotation_factor)
+
+        tangential = np.column_stack((-np.sin(theta), np.cos(theta), np.zeros(nd)))
+        radial = np.column_stack((np.cos(theta), np.sin(theta), np.zeros(nd)))
+        vel[is_disk] = tangential * v_circ[:, None]
+        vel[is_disk] += radial * rng.normal(0.0, float(args.radial_velocity_noise), size=(nd, 1))
+        vel[is_disk, 2] += rng.normal(0.0, float(args.vertical_velocity_noise), size=nd)
+
+    # -----------------------------
+    # Bojo central
+    # -----------------------------
+    nb = int(np.count_nonzero(is_bulge))
+    if nb:
+        sigma = radius * 0.105
+        bulge = rng.normal(0.0, sigma, size=(nb, 3))
+        bulge[:, 2] *= 0.62
+        pos[is_bulge] = bulge
+        # O bojo não roda como o disco; é mais disperso.
+        speed = rng.normal(0.0, float(args.bulge_velocity_noise), size=(nb, 3))
+        vel[is_bulge] = speed
+        mass[is_bulge] *= 1.18
+
+    # -----------------------------
+    # Halo esférico difuso
+    # -----------------------------
+    nh = int(np.count_nonzero(is_halo))
+    if nh:
+        rr = radius * float(args.halo_radius_factor) * (rng.random(nh) ** (1.0 / 3.0))
+        cos_phi = rng.uniform(-1.0, 1.0, size=nh)
+        phi = rng.uniform(0.0, 2.0 * np.pi, size=nh)
+        sin_phi = np.sqrt(np.maximum(0.0, 1.0 - cos_phi * cos_phi))
+        pos[is_halo, 0] = rr * sin_phi * np.cos(phi)
+        pos[is_halo, 1] = rr * sin_phi * np.sin(phi)
+        pos[is_halo, 2] = rr * cos_phi * 0.72
+        vel[is_halo] = rng.normal(0.0, float(args.halo_velocity_noise), size=(nh, 3))
+        mass[is_halo] *= 0.72
+
+    # Pequenas perturbações suavizam a evolução sem destruir os braços.
     vel += rng.normal(0.0, float(args.velocity_noise), size=(n, 3))
-    vel[:, 2] *= 0.20
 
-    # Remove centre-of-mass drift.
-    pos -= np.average(pos, axis=0, weights=mass)
-    vel -= np.average(vel, axis=0, weights=mass)
     return ids, pos.astype(np.float64), vel.astype(np.float64), mass.astype(np.float64)
 
 
@@ -117,69 +152,56 @@ def acceleration_from_block(
     softening: float,
     pair_block: int,
 ) -> Array:
-    """Acceleration on local particles caused by a block of other particles.
+    """
+    Aceleração gravitacional causada por um bloco de partículas.
 
-    Newtonian acceleration from a particle j on i:
-
+    Para uma estrela i e uma estrela j:
         a_i += G * m_j * (r_j - r_i) / (|r_j-r_i|^2 + eps^2)^(3/2)
 
-    The particle's own block may include itself. For self-interaction the difference
-    vector is zero, therefore the contribution is zero even with softening.
+    A divisão em blocos evita criar uma matriz NxN demasiado grande em memória.
     """
-    if local_pos.size == 0 or block_pos.size == 0:
-        return np.zeros_like(local_pos)
+    local_pos = np.asarray(local_pos, dtype=np.float64)
+    block_pos = np.asarray(block_pos, dtype=np.float64)
+    block_mass = np.asarray(block_mass, dtype=np.float64)
 
     acc = np.zeros_like(local_pos, dtype=np.float64)
-    eps2 = float(softening) * float(softening)
-    step = max(1, int(pair_block))
+    if local_pos.size == 0 or block_pos.size == 0:
+        return acc
 
-    for start in range(0, len(block_pos), step):
-        end = min(start + step, len(block_pos))
-        bp = block_pos[start:end]
-        bm = block_mass[start:end]
-        diff = bp[None, :, :] - local_pos[:, None, :]
-        dist2 = np.einsum("ijk,ijk->ij", diff, diff) + eps2
-        inv_dist3 = 1.0 / (dist2 * np.sqrt(dist2))
-        acc += float(g_const) * np.einsum("ijk,j,ij->ik", diff, bm, inv_dist3)
+    chunk = max(32, int(pair_block))
+    eps2 = float(softening) ** 2
+    g = float(g_const)
+
+    for start in range(0, local_pos.shape[0], chunk):
+        end = min(start + chunk, local_pos.shape[0])
+        diff = block_pos[None, :, :] - local_pos[start:end, None, :]
+        dist2 = np.sum(diff * diff, axis=2) + eps2
+        inv_dist3 = dist2 ** -1.5
+        # Se diff == 0, a contribuição é zero. O softening evita singularidades.
+        weighted = diff * (block_mass[None, :] * inv_dist3)[:, :, None]
+        acc[start:end] += g * np.sum(weighted, axis=1)
 
     return acc
 
 
 def central_mass_acceleration(local_pos: Array, args) -> Array:
-    """Acceleration caused by a massive object at the origin.
-
-    This improves orbital structure and is physically plausible for a galaxy proxy,
-    while still keeping the N-body star-star interaction in the code.
-    """
-    if local_pos.size == 0 or float(args.central_mass) <= 0.0:
-        return np.zeros_like(local_pos)
-    diff = -local_pos
-    eps2 = float(args.softening) * float(args.softening)
-    dist2 = np.einsum("ij,ij->i", diff, diff) + eps2
-    inv_dist3 = 1.0 / (dist2 * np.sqrt(dist2))
-    return float(args.g_const) * float(args.central_mass) * diff * inv_dist3[:, None]
-
-
-def leapfrog_drift_kick(local_pos: Array, local_vel: Array, acc_old: Array, acc_new: Array, dt: float) -> Tuple[Array, Array]:
-    """Complete a velocity-Verlet / Leapfrog update.
-
-    This function is provided for clarity. In the main loop the same steps are kept
-    explicit because the new acceleration is computed through MPI communication:
-
-        v(t+dt/2) = v(t) + 0.5 dt a(t)
-        x(t+dt)   = x(t) + dt v(t+dt/2)
-        v(t+dt)   = v(t+dt/2) + 0.5 dt a(t+dt)
-    """
-    half = 0.5 * float(dt)
-    v_half = local_vel + half * acc_old
-    new_pos = local_pos + float(dt) * v_half
-    new_vel = v_half + half * acc_new
-    return new_pos, new_vel
+    """Aceleração causada por uma massa central, útil para estabilidade orbital."""
+    pos = np.asarray(local_pos, dtype=np.float64)
+    if pos.size == 0:
+        return np.zeros_like(pos)
+    eps2 = float(args.softening) ** 2
+    r2 = np.sum(pos * pos, axis=1) + eps2
+    inv_r3 = r2 ** -1.5
+    return -float(args.g_const) * float(args.central_mass) * pos * inv_r3[:, None]
 
 
 def local_basic_diagnostics(pos: Array, vel: Array, mass: Array) -> Dict[str, Array | float]:
-    """Rank-local diagnostics that can be combined with MPI allreduce."""
-    if len(pos) == 0:
+    """Diagnósticos locais combinados depois por allreduce()."""
+    pos = np.asarray(pos, dtype=np.float64)
+    vel = np.asarray(vel, dtype=np.float64)
+    mass = np.asarray(mass, dtype=np.float64)
+
+    if mass.size == 0:
         return {
             "kinetic": 0.0,
             "mass": 0.0,
@@ -189,32 +211,32 @@ def local_basic_diagnostics(pos: Array, vel: Array, mass: Array) -> Dict[str, Ar
             "angular_momentum": np.zeros(3, dtype=np.float64),
         }
 
-    speed2 = np.einsum("ij,ij->i", vel, vel)
+    speed2 = np.sum(vel * vel, axis=1)
     speed = np.sqrt(speed2)
     radius = np.linalg.norm(pos, axis=1)
-    kinetic = 0.5 * float(np.sum(mass * speed2))
-    angular_momentum = np.sum(np.cross(pos, mass[:, None] * vel), axis=0)
 
     return {
-        "kinetic": kinetic,
+        "kinetic": float(0.5 * np.sum(mass * speed2)),
         "mass": float(np.sum(mass)),
         "speed_mass_sum": float(np.sum(mass * speed)),
         "radius_mass_sum": float(np.sum(mass * radius)),
         "max_radius": float(np.max(radius)),
-        "angular_momentum": angular_momentum.astype(np.float64),
+        "angular_momentum": np.sum(np.cross(pos, vel) * mass[:, None], axis=0),
     }
 
 
 def snapshot_energy_diagnostics(snapshot: Dict[str, Array], args) -> Dict[str, float]:
-    """Compute global physical diagnostics on rank 0 from a gathered snapshot.
-
-    For normal report-scale runs this is exact. For very large debug runs the pair
-    potential can be sampled by setting --energy-sample-limit to a lower value.
     """
-    pos = snapshot["pos"]
-    vel = snapshot["vel"]
-    mass = snapshot["mass"]
-    n = len(pos)
+    Energia e métricas para o relatório.
+
+    Para muitos pontos, a energia potencial é estimada por amostragem para não
+    bloquear a geração do GIF.
+    """
+    pos = np.asarray(snapshot["pos"], dtype=np.float64)
+    vel = np.asarray(snapshot["vel"], dtype=np.float64)
+    mass = np.asarray(snapshot["mass"], dtype=np.float64)
+    n = int(pos.shape[0])
+
     if n == 0:
         return {
             "kinetic": 0.0,
@@ -228,53 +250,53 @@ def snapshot_energy_diagnostics(snapshot: Dict[str, Array], args) -> Dict[str, f
             "potential_is_estimated": 0.0,
         }
 
-    speed2 = np.einsum("ij,ij->i", vel, vel)
+    speed2 = np.sum(vel * vel, axis=1)
     speed = np.sqrt(speed2)
     radius = np.linalg.norm(pos, axis=1)
-    kinetic = 0.5 * float(np.sum(mass * speed2))
+    kinetic = float(0.5 * np.sum(mass * speed2))
 
-    sample_limit = int(getattr(args, "energy_sample_limit", 5000))
-    potential_is_estimated = 0.0
-    if n > sample_limit > 1:
-        rng = np.random.default_rng(int(args.seed) + 98765)
-        idx = np.sort(rng.choice(n, size=sample_limit, replace=False))
-        p_pos = pos[idx]
-        p_mass = mass[idx]
-        scale = (float(n) * float(n - 1)) / (float(sample_limit) * float(sample_limit - 1))
-        potential_is_estimated = 1.0
+    limit = int(getattr(args, "energy_sample_limit", 2500))
+    estimated = 0.0
+    if n > limit:
+        rng = np.random.default_rng(int(args.seed) + 991)
+        idx = rng.choice(n, size=limit, replace=False)
+        sample_pos = pos[idx]
+        sample_mass = mass[idx]
+        scale = (n / limit) ** 2
+        estimated = 1.0
     else:
-        p_pos = pos
-        p_mass = mass
+        sample_pos = pos
+        sample_mass = mass
         scale = 1.0
 
-    eps2 = float(args.softening) * float(args.softening)
-    potential_pairs = 0.0
-    m = len(p_pos)
-    for i in range(m - 1):
-        diff = p_pos[i + 1 :] - p_pos[i]
-        dist = np.sqrt(np.einsum("ij,ij->i", diff, diff) + eps2)
-        potential_pairs -= float(args.g_const) * float(p_mass[i]) * float(np.sum(p_mass[i + 1 :] / dist))
-    potential_pairs *= scale
+    potential = 0.0
+    eps2 = float(args.softening) ** 2
+    g = float(args.g_const)
+    m = sample_pos.shape[0]
+    for i in range(m):
+        diff = sample_pos[i + 1 :] - sample_pos[i]
+        if diff.size == 0:
+            continue
+        dist = np.sqrt(np.sum(diff * diff, axis=1) + eps2)
+        potential -= float(np.sum(g * sample_mass[i] * sample_mass[i + 1 :] / dist))
+    potential *= scale
 
-    # Central mass potential is exact for all particles.
-    potential_central = 0.0
-    if float(args.central_mass) > 0.0:
-        r = np.sqrt(np.einsum("ij,ij->i", pos, pos) + eps2)
-        potential_central = -float(args.g_const) * float(args.central_mass) * float(np.sum(mass / r))
+    # Potencial da massa central.
+    dist_c = np.sqrt(np.sum(pos * pos, axis=1) + eps2)
+    potential -= float(np.sum(g * float(args.central_mass) * mass / dist_c))
 
-    potential = potential_pairs + potential_central
-    total_energy = kinetic + potential
-    virial_ratio = (2.0 * kinetic / abs(potential)) if abs(potential) > 1e-30 else 0.0
-    angular_momentum = np.sum(np.cross(pos, mass[:, None] * vel), axis=0)
+    total = kinetic + potential
+    virial = float(2.0 * kinetic / abs(potential)) if abs(potential) > 1e-30 else 0.0
+    angular = np.sum(np.cross(pos, vel) * mass[:, None], axis=0)
 
     return {
         "kinetic": kinetic,
-        "potential": potential,
-        "total_energy": total_energy,
-        "virial_ratio": virial_ratio,
+        "potential": float(potential),
+        "total_energy": float(total),
+        "virial_ratio": virial,
         "max_radius": float(np.max(radius)),
         "mean_radius": float(np.average(radius, weights=mass)),
         "mean_speed": float(np.average(speed, weights=mass)),
-        "angular_momentum_norm": float(np.linalg.norm(angular_momentum)),
-        "potential_is_estimated": potential_is_estimated,
+        "angular_momentum_norm": float(np.linalg.norm(angular)),
+        "potential_is_estimated": estimated,
     }
