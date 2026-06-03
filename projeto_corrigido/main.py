@@ -39,8 +39,10 @@ from gif_visualization import (
     render_scale_frame,
 )
 from mpi_parallelization import (
+    aggregate_timer_values,
     allreduce_basic_diagnostics,
     bcast_config,
+    center_local_particles,
     compute_acceleration_ring,
     create_local_particles,
     get_mpi,
@@ -70,6 +72,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--softening", type=float, default=9.0)
     p.add_argument("--pair-block", type=int, default=384, help="Bloco vetorizado do cálculo de forças.")
     p.add_argument("--energy-sample-limit", type=int, default=2500)
+    p.add_argument(
+        "--no-center-initial-conditions",
+        dest="center_initial_conditions",
+        action="store_false",
+        help="Desativa a correção inicial do centro de massa. Por defeito, a galáxia é centrada após a geração paralela.",
+    )
+    p.set_defaults(center_initial_conditions=True)
+    p.add_argument(
+        "--recenter-every",
+        type=int,
+        default=0,
+        help="Opcional: recentra a galáxia a cada N passos. 0 mantém apenas a correção inicial, que é a opção mais física.",
+    )
 
     # Estrutura galáctica.
     p.add_argument("--galaxy-radius", type=float, default=125.0)
@@ -159,6 +174,7 @@ def validate_args(args: argparse.Namespace) -> None:
         (args.spiral_arms >= 1, "--spiral-arms tem de ser >= 1"),
         (args.scale_sample_particles > 0, "--scale-sample-particles tem de ser positivo"),
         (args.scale_frames >= 2, "--scale-frames tem de ser >= 2"),
+        (args.recenter_every >= 0, "--recenter-every tem de ser >= 0"),
     ]
     for ok, msg in checks:
         if not ok:
@@ -267,6 +283,15 @@ def run_direct_physics(
     local = create_local_particles(comm, rank, size, args)
     timers.add("initial_conditions", time.perf_counter() - t_init)
 
+    # Correção inicial do centro de massa: importante porque as condições iniciais
+    # são geradas por amostragem estatística em paralelo. Isto evita uma deriva
+    # global artificial da galáxia em relação à massa central fixa na origem.
+    initial_centering_info: Dict[str, float] = {}
+    if bool(args.center_initial_conditions):
+        t_center = time.perf_counter()
+        initial_centering_info = center_local_particles(comm, MPI, local, center_velocity=True)
+        timers.add("recentering", time.perf_counter() - t_center)
+
     counts = comm.allgather(int(len(local["ids"])))
     total_checked = comm.reduce(int(len(local["ids"])), op=MPI.SUM, root=0)
 
@@ -274,6 +299,14 @@ def run_direct_physics(
         print("=== Simulação física direta N-body ===")
         print(f"Partículas: {args.particles:,} | ranks MPI: {size} | distribuição: {counts}")
         print(f"Validação reduce(): {total_checked:,} partículas")
+        if initial_centering_info:
+            print(
+                "Centro de massa inicial corrigido: "
+                f"COM=({initial_centering_info['com_x']:.4e}, "
+                f"{initial_centering_info['com_y']:.4e}, "
+                f"{initial_centering_info['com_z']:.4e}), "
+                f"|V_COM|={initial_centering_info['com_speed']:.4e}"
+            )
         print("MPI: bcast, scatter, allgather, isend/irecv, gather, reduce, allreduce, Barrier")
         print(f"Frames previstos: ~{math.floor(args.years / args.plot_interval) + 1}")
         if serial_fallback:
@@ -378,10 +411,18 @@ def run_direct_physics(
         local["vel"] += half_dt * new_acc
         acc = new_acc
 
+        # Opcional para testes longos/visuais. Mantém a galáxia centrada, mas por
+        # defeito fica desligado para não introduzir correção artificial a cada passo.
+        if int(args.recenter_every) > 0 and ((step + 1) % int(args.recenter_every) == 0):
+            t_center = time.perf_counter()
+            center_local_particles(comm, MPI, local, center_velocity=True)
+            timers.add("recentering", time.perf_counter() - t_center)
+
     comm.Barrier()
     total_runtime = time.perf_counter() - total_start
     timers.values["total"] = total_runtime
 
+    gif_path = Path("not_generated")
     if rank == 0:
         gif_path = out_dir / args.gif_name
         if frame_paths and not args.no_gif and not args.no_plot:
@@ -393,6 +434,10 @@ def run_direct_physics(
         else:
             gif_path = Path("not_generated")
 
+    # Todos os ranks participam: o tempo paralelo relevante é o máximo por fase.
+    timer_summary = aggregate_timer_values(comm, MPI, timers.values)
+
+    if rank == 0:
         summary_extra = {
             "mpi_ranks": int(size),
             "particle_counts_per_rank": str(counts),
@@ -400,13 +445,16 @@ def run_direct_physics(
             "steps": int(steps),
             "frames": int(frame_number),
             "actual_plot_interval_years": float(plot_every_steps) * float(args.dt),
+            "center_initial_conditions": bool(args.center_initial_conditions),
+            "initial_center_of_mass_before_correction": str(initial_centering_info) if initial_centering_info else "not_applied",
+            "recenter_every_steps": int(args.recenter_every),
             "gif_path": str(out_dir / args.gif_name) if frame_paths and not args.no_gif and not args.no_plot else "not_generated",
             "physics_model": "Newtonian all-pairs N-body with gravitational softening and central mass",
             "integrator": "Leapfrog / velocity-Verlet",
             "mpi_methods": "bcast; scatter; allgather; isend; irecv; gather; reduce; allreduce; Barrier",
             "csv_delimiter": ";",
         }
-        write_runtime_summary(out_dir / "runtime_summary.csv", args, summary_extra, timers.as_dict())
+        write_runtime_summary(out_dir / "runtime_summary.csv", args, summary_extra, timer_summary)
         write_csv_semicolon(out_dir / "frame_results.csv", frame_records)
 
         print(f"Runtime CSV: {out_dir / 'runtime_summary.csv'}")

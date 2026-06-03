@@ -253,3 +253,86 @@ def allreduce_basic_diagnostics(comm: Any, MPI: Any, local_diag: Dict[str, Any])
         "max_radius_allreduce": float(max_radius),
         "angular_momentum_norm_allreduce": float(np.linalg.norm(angular)),
     }
+
+def center_local_particles(
+    comm: Any,
+    MPI: Any,
+    local: Dict[str, Array],
+    center_velocity: bool = True,
+) -> Dict[str, float]:
+    """
+    Corrige o centro de massa global da simulação.
+
+    Esta operação usa allreduce() e é útil sobretudo no arranque: como cada rank
+    gera partículas por amostragem aleatória, a galáxia pode começar ligeiramente
+    deslocada do referencial da massa central. Recentrar as condições iniciais
+    melhora a estabilidade visual/física sem retirar a paralelização.
+
+    Se center_velocity=True, remove também a velocidade média ponderada pela massa,
+    reduzindo deriva global artificial.
+    """
+    mass = np.asarray(local["mass"], dtype=np.float64)
+    pos = np.asarray(local["pos"], dtype=np.float64)
+    vel = np.asarray(local["vel"], dtype=np.float64)
+
+    local_mass = float(np.sum(mass))
+    if local_mass > 0.0:
+        local_pos_moment = np.sum(pos * mass[:, None], axis=0)
+        local_vel_moment = np.sum(vel * mass[:, None], axis=0)
+    else:
+        local_pos_moment = np.zeros(3, dtype=np.float64)
+        local_vel_moment = np.zeros(3, dtype=np.float64)
+
+    total_mass = float(comm.allreduce(local_mass, op=MPI.SUM))
+    global_pos_moment = comm.allreduce(np.asarray(local_pos_moment, dtype=np.float64), op=MPI.SUM)
+    global_vel_moment = comm.allreduce(np.asarray(local_vel_moment, dtype=np.float64), op=MPI.SUM)
+
+    if total_mass <= 0.0:
+        return {
+            "total_mass": 0.0,
+            "com_x": 0.0,
+            "com_y": 0.0,
+            "com_z": 0.0,
+            "com_speed": 0.0,
+        }
+
+    com = np.asarray(global_pos_moment, dtype=np.float64) / total_mass
+    cov = np.asarray(global_vel_moment, dtype=np.float64) / total_mass
+
+    local["pos"] = np.ascontiguousarray(pos - com[None, :], dtype=np.float64)
+    if center_velocity:
+        local["vel"] = np.ascontiguousarray(vel - cov[None, :], dtype=np.float64)
+
+    return {
+        "total_mass": float(total_mass),
+        "com_x": float(com[0]),
+        "com_y": float(com[1]),
+        "com_z": float(com[2]),
+        "com_speed": float(np.linalg.norm(cov)),
+    }
+
+
+def aggregate_timer_values(comm: Any, MPI: Any, timer_values: Dict[str, float]) -> Dict[str, float]:
+    """
+    Agrega tempos por allreduce(MAX) para reportar o custo real paralelo.
+
+    Em MPI, o tempo de uma fase deve ser interpretado como o máximo entre ranks,
+    porque todos esperam pelo processo mais lento nas sincronizações.
+    """
+    keys = [
+        "initial_conditions",
+        "recentering",
+        "physics",
+        "communication",
+        "diagnostics_and_gather",
+        "energy_diagnostics",
+        "plotting",
+        "gif_creation",
+        "total",
+    ]
+    out: Dict[str, float] = {}
+    for key in keys:
+        value = float(timer_values.get(key, 0.0))
+        out[key] = float(comm.allreduce(value, op=MPI.MAX))
+    return out
+

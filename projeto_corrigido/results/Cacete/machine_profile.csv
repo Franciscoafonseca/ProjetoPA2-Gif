@@ -1,2 +1,2 @@
 timestamp;machine;system;release;version;python;architecture;cpu_name;logical_cores_os_cpu_count;ram_gb_windows_wmic;notes
-2026-05-31T23:29:27;Cacete;Windows;11;10.0.26200;3.14.5;64bit;ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc;8;;Preencher manualmente no relatório: CPU exato, RAM, se estava ligado à corrente, plano de energia.
+2026-06-03T17:00:57;Cacete;Windows;11;10.0.26200;3.14.5;64bit;ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc;8;;Preencher manualmente no relatório: CPU exato, RAM, se estava ligado à corrente, plano de energia.
