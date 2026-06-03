@@ -1,0 +1,2 @@
+particles;steps;interactions_per_step;total_interactions;assumed_pair_rate_per_rank_per_second;ranks;estimated_runtime_seconds;estimated_runtime_human;note
+1000000000;50000000;1.000000e+18;5.000000e+25;6.500000e+07;4;1.923077e+17;6.09e+09 anos;"Estimativa para método direto O(N^2); para escala real usar Barnes-Hut/FMM/GPU/árvore distribuída."

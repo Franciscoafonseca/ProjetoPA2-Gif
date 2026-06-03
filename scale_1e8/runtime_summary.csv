@@ -1,2 +1,0 @@
-mode;represented_particles;actual_sample_particles;mpi_ranks;frames;years;runtime_seconds;gif;note
-scale_gif_proxy;100000000;300000;4;120;1000000000.0;281.167425;scale_1e8\galaxy_scale_proxy_all_particles.gif;"Weighted density proxy; not a direct O(N^2) N-body execution."
