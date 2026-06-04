@@ -46,4 +46,7 @@ dist/
 # Temporary files
 tmp/
 temp/
-*.tmp
+*.tmp__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
