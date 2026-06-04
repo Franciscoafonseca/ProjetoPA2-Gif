@@ -1,0 +1,2 @@
+timestamp;machine;system;release;version;python;architecture;cpu_name;logical_cores_os_cpu_count;ram_gb_windows_wmic;notes
+2026-06-04T22:21:44;DESKTOP-CVDFUJ0;Windows;10;10.0.26200;3.8.20;64bit;Intel(R) Core(TM) i7-10700F CPU @ 2.90GHz;16;15.92;Preencher manualmente no relatório: CPU exato, RAM, se estava ligado à corrente, plano de energia.
