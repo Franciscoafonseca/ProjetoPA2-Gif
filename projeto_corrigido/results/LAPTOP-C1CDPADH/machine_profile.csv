@@ -1,2 +1,0 @@
-timestamp;machine;system;release;version;python;architecture;cpu_name;logical_cores_os_cpu_count;ram_gb_windows_wmic;notes
-2026-06-03T22:32:04;LAPTOP-C1CDPADH;Windows;11;10.0.26200;3.13.1;64bit;AMD Ryzen 7 6800HS with Radeon Graphics;16;15.25;Preencher manualmente no relatório: CPU exato, RAM, se estava ligado à corrente, plano de energia.
